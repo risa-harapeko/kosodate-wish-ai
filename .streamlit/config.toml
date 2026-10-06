@@ -1,0 +1,7 @@
+# ページの色（あたたかいベージュ）
+[theme]
+base = "light"
+primaryColor = "#A85A3A"              # ボタンなどのメインの色（テラコッタ）
+backgroundColor = "#FAF6F0"           # ページの背景（生成り）
+secondaryBackgroundColor = "#F1E8DC"  # 入力欄や吹き出しの背景（ベージュ）
+textColor = "#4A3F35"                 # 文字の色（こげ茶）
