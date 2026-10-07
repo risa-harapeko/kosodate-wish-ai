@@ -2,3 +2,5 @@
 __pycache__/
 records.csv
 secrets_for_cloud.txt
+weekly_summaries.json
+records_backup*.csv

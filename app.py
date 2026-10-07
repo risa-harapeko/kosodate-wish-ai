@@ -1,10 +1,15 @@
 import csv
 import hmac
+import json
 import os
-from datetime import datetime
+from collections import Counter
+from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Literal
 
+import altair as alt
 import anthropic
+import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 from pydantic import BaseModel
@@ -20,7 +25,22 @@ MODEL = "claude-sonnet-5-5"
 
 # 記録の保存先（個人的な内容なので .gitignore でGitHubに上げない）
 RECORDS_FILE = Path(__file__).parent / "records.csv"
-COLUMNS = ["日時", "場面", "イライラ度（前）", "イライラ度（後）", "出来事", "願い", "行動"]
+COLUMNS = ["日時", "場面", "イライラ度（前）", "イライラ度（後）", "出来事", "願い", "願いの種類", "行動"]
+# グラフで数えやすいよう、願いをこの中のどれか1つに分類する（AIへの指示の「願いの見つけ方」と同じ言葉）
+WISH_CATEGORIES = [
+    "休息・余白", "自由・自分のペース", "安心", "尊重", "わかってもらうこと", "つながり", "頼れること",
+    "公平さ", "自分らしさ", "有能感（ちゃんとできている実感）", "楽しさ", "成長", "貢献",
+]
+WishCategory = Literal[
+    "休息・余白", "自由・自分のペース", "安心", "尊重", "わかってもらうこと", "つながり", "頼れること",
+    "公平さ", "自分らしさ", "有能感（ちゃんとできている実感）", "楽しさ", "成長", "貢献",
+]
+# 週のまとめの保存先（記録と同じく個人的な内容なので GitHub に上げない）
+WEEKLY_FILE = Path(__file__).parent / "weekly_summaries.json"
+WEEKDAYS = "月火水木金土日"
+BAR_COLOR = "#A85A3A"  # ボタンと同じテラコッタ
+TEXT_COLOR = "#4A3F35"
+GRID_COLOR = "#E8DFD3"
 SCENES = ["朝の支度", "食事", "寝かしつけ", "仕事", "パートナー", "その他"]
 LEVELS = {1: "1 ちょっとモヤッと", 2: "2 モヤモヤ", 3: "3 イライラ", 4: "4 かなりイライラ", 5: "5 爆発しそう"}
 # 話したあとは、いちばん軽い「1」を「すっきりした！」と表す（数字の意味は同じ）
@@ -94,10 +114,36 @@ SYSTEM_PROMPT = """あなたは、仕事と子育てを両立している母親�
 
 # 記録用に、会話から「願い」と「行動」を決まった形で取り出すための指示
 SUMMARY_PROMPT = """これから渡すのは、イライラした出来事について、本人とAIが話した会話です。
-記録のために、次の2つを取り出してください。
+記録のために、次の3つを取り出してください。
 - wish: 本人が「しっくりくる」と選んだ願い。選んでいなければ、AIが示した願いのうち中心となるもの。
-  「〜を大切にしたかった」の「〜」の部分を、20〜40字程度で。願いがまだ出ていなければ空文字。
+  「〜を大切にしたかった」の「〜」の部分だけを、20〜40字程度の名詞の形で（例：「頑張りをわかってもらえること」）。
+  「を大切にしたかった」は含めない。願いがまだ出ていなければ空文字。
+- category: wish にいちばん近い願いの種類を、選択肢から1つ。
 - actions: AIが提案した小さな行動を、1つ15字程度に短くしたもの。提案がなければ空のリスト。"""
+
+# 週の記録から、傾向と対策をまとめるための指示
+WEEKLY_PROMPT = """あなたは、仕事と子育てを両立している母親の「イライラの記録」を一緒にふりかえる、やさしい伴走者です。
+これから、ある1週間の記録を渡します。各記録には、日時（曜日）・場面・話す前と後のイライラ度（1〜5）・
+出来事・見つかった願い・願いの種類・AIが提案した行動が入っています。
+
+次の見出しで、短くまとめてください（全体で400〜600字程度、やわらかい話し言葉で）。
+
+### 今週のふりかえり
+記録の数と、話す前と後でイライラ度がどう変わったかを、ねぎらいの言葉とともに。
+
+### イライラしやすかった場面・曜日・時間帯
+記録から読み取れる傾向。記録が少なく傾向と言えない項目は、無理に言わず「まだわからない」とする。
+
+### くり返し出てきた願い
+願いの種類や言葉の共通点から、本人が大切にしていることを「〜かもしれません」と伝える。
+
+### 来週ためせる小さなこと
+傾向と願いにつながる、小さな行動を2〜3個。「休む」「手放す」「頼る」「伝える」方向のものにし、
+頑張りを増やす行動（早起き・もっと計画的に など）は入れない。やらなくてもいい前提で伝える。
+
+守ること：説教しない。「母親なのだから」「〜すべき」と言わない。本人や家族を評価・批判しない。
+記録に「消えたい」「子どもを叩いてしまいそう」など安全に関わる内容があれば、まとめより先に気持ちを受け止め、
+児童相談所 虐待対応ダイヤル「189」やよりそいホットライン 0120-279-338（どちらも24時間・無料）を案内する。"""
 
 END_MARK = "[END]"  # AIが会話を締めくくったときの合図
 
@@ -106,7 +152,12 @@ FIRST_MESSAGE ="こんにちは。最近イライラしたことを、そのま�
 
 class Summary(BaseModel):
     wish: str
+    category: WishCategory
     actions: list[str]
+
+
+class Categories(BaseModel):
+    categories: list[WishCategory]
 
 
 @st.cache_resource
@@ -145,24 +196,132 @@ def summarize(messages: list[dict]) -> Summary:
         messages=[{"role": "user", "content": transcript}],
         output_format=Summary,
     )
-    return response.parsed_output or Summary(wish="", actions=[])
+    summary = response.parsed_output
+    if summary is None:  # AIが答えられなかったときは空のまま記録する
+        return Summary.model_construct(wish="", category="", actions=[])
+    summary.wish = clean_wish(summary.wish)
+    return summary
+
+
+def clean_wish(wish: str) -> str:
+    # グラフで同じ願いを数えやすいよう、書き方をそろえる
+    for tail in ["を大切にしたかった", "を大切にしたい", "。"]:
+        wish = wish.removesuffix(tail)
+    return wish.strip()
+
+
+def classify_wishes(wishes: list[str]) -> list[str]:
+    # 「願いの種類」がまだない古い記録を、まとめて分類する
+    response = get_client().messages.parse(
+        model=MODEL,
+        max_tokens=4000,
+        system="渡す願いのそれぞれについて、いちばん近い願いの種類を選択肢から1つ選び、同じ順番で返してください。",
+        messages=[{"role": "user", "content": "\n".join(f"{i + 1}. {w}" for i, w in enumerate(wishes))}],
+        output_format=Categories,
+    )
+    result = response.parsed_output
+    if result is None or len(result.categories) != len(wishes):
+        return [""] * len(wishes)
+    return list(result.categories)
+
+
+def write_records(records: list[dict]) -> None:
+    # Excelで文字化けしないよう、BOM付きUTF-8で書く
+    with open(RECORDS_FILE, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=COLUMNS, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(records)
 
 
 def save_record(row: dict) -> None:
-    # Excelで文字化けしないよう、新しく作るときだけBOM付きUTF-8にする
-    is_new = not RECORDS_FILE.exists()
-    with open(RECORDS_FILE, "w" if is_new else "a", encoding="utf-8-sig" if is_new else "utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=COLUMNS)
-        if is_new:
-            writer.writeheader()
-        writer.writerow(row)
+    # 項目が増えても古い記録とずれないよう、毎回すべて書き直す（記録は多くても数百件なので十分速い）
+    write_records(load_records() + [row])
 
 
 def load_records() -> list[dict]:
     if not RECORDS_FILE.exists():
         return []
     with open(RECORDS_FILE, encoding="utf-8-sig", newline="") as f:
-        return list(csv.DictReader(f))
+        records = list(csv.DictReader(f))
+    for r in records:  # あとから増えた項目は空にしておく
+        for col in COLUMNS:
+            r[col] = r.get(col) or ""
+    return records
+
+
+def week_start(date_text: str) -> str:
+    # 記録の日時から、その週の月曜日の日付を返す
+    day = datetime.strptime(date_text, "%Y-%m-%d %H:%M")
+    return (day - timedelta(days=day.weekday())).strftime("%Y-%m-%d")
+
+
+def week_label(start: str) -> str:
+    first = datetime.strptime(start, "%Y-%m-%d")
+    last = first + timedelta(days=6)
+    return f"{first:%m/%d}（月）〜 {last:%m/%d}（日）の週"
+
+
+def load_weekly() -> dict:
+    if not WEEKLY_FILE.exists():
+        return {}
+    return json.loads(WEEKLY_FILE.read_text(encoding="utf-8"))
+
+
+def save_weekly(start: str, text: str) -> None:
+    weekly = load_weekly()
+    weekly[start] = text
+    WEEKLY_FILE.write_text(json.dumps(weekly, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def make_weekly_summary(records: list[dict]) -> str:
+    lines = []
+    for r in records:
+        day = datetime.strptime(r["日時"], "%Y-%m-%d %H:%M")
+        lines.append(
+            f"- {r['日時']}（{WEEKDAYS[day.weekday()]}）／場面：{r['場面']}／イライラ度：{r['イライラ度（前）']}→{r['イライラ度（後）']}"
+            f"／出来事：{r['出来事']}／願い：{r['願い']}（{r['願いの種類']}）／提案された行動：{r['行動']}"
+        )
+    # 件数や平均はAIに数えさせず、計算した値を渡す
+    before = [int(r["イライラ度（前）"]) for r in records]
+    after = [int(r["イライラ度（後）"]) for r in records]
+    facts = (
+        f"記録の数：{len(records)}件\n"
+        f"イライラ度の平均：話す前 {sum(before) / len(before):.1f} → 話した後 {sum(after) / len(after):.1f}\n"
+        f"話して下がった記録：{sum(1 for b, a in zip(before, after) if a < b)}件\n"
+        f"場面ごとの件数：{'、'.join(f'{k} {v}件' for k, v in Counter(r['場面'] for r in records).most_common())}\n"
+        "（数字はこの値をそのまま使うこと）\n\n記録：\n"
+    )
+    response = get_client().beta.messages.create(
+        model=MODEL,
+        max_tokens=16000,
+        system=WEEKLY_PROMPT,
+        messages=[{"role": "user", "content": facts + "\n".join(lines)}],
+        output_config={"effort": "medium"},
+        betas=["server-side-fallback-2026-07-01"],
+        fallbacks="default",
+    )
+    if response.stop_reason == "refusal":
+        return "ごめんなさい、今回はうまくまとめられませんでした。時間をおいて、もう一度ためしてみてください。"
+    return "".join(b.text for b in response.content if b.type == "text")
+
+
+def bar_chart(counts: Counter, label: str) -> alt.Chart:
+    # 横向きの棒グラフ（多い順）。棒の先だけ角を丸め、目盛りの線は控えめにする
+    df = pd.DataFrame(counts.most_common(), columns=[label, "件数"])
+    return (
+        alt.Chart(df)
+        .mark_bar(color=BAR_COLOR, cornerRadiusEnd=4, size=16)
+        .encode(
+            x=alt.X("件数:Q", title=None, axis=alt.Axis(tickMinStep=1, format="d", gridColor=GRID_COLOR,
+                                                       domain=False, ticks=False, labelColor=TEXT_COLOR)),
+            y=alt.Y(f"{label}:N", sort="-x", title=None,
+                    axis=alt.Axis(domain=False, ticks=False, labelColor=TEXT_COLOR, labelLimit=220, labelFontSize=13)),
+            tooltip=[alt.Tooltip(f"{label}:N"), alt.Tooltip("件数:Q")],
+        )
+        .properties(height=max(90, 34 * len(df)))
+        .configure_view(stroke=None)
+        .configure(background="transparent")
+    )
 
 
 def reset_conversation() -> None:
@@ -248,6 +407,7 @@ def talk_page() -> None:
                     "イライラ度（後）": st.session_state.after,
                     "出来事": messages[0]["content"],
                     "願い": summary.wish,
+                    "願いの種類": summary.category,
                     "行動": " / ".join(summary.actions),
                 })
                 st.session_state.saved = {
@@ -329,6 +489,66 @@ def history_page() -> None:
     st.caption(f"記録は {RECORDS_FILE.name} に保存されています（Excelでも開けます）。")
 
 
+def review_page() -> None:
+    st.title("ふりかえり")
+    records = load_records()
+    if not records:
+        st.info("まだ記録がありません。記録がたまると、ここでイライラしやすい場面やよく出る願いが見られます。")
+        return
+
+    # 「願いの種類」がない古い記録があれば、先にまとめて分類しておく
+    missing = [r for r in records if r["願い"] and not r["願いの種類"]]
+    if missing:
+        for r in records:
+            r["願い"] = clean_wish(r["願い"])
+        with st.spinner("これまでの記録の願いを分類しています…"):
+            for r, category in zip(missing, classify_wishes([r["願い"] for r in missing])):
+                r["願いの種類"] = category
+        write_records(records)
+
+    # 全体の数字
+    before = [int(r["イライラ度（前）"]) for r in records]
+    after = [int(r["イライラ度（後）"]) for r in records]
+    lowered = sum(1 for b, a in zip(before, after) if a < b)
+    col1, col2, col3 = st.columns(3)
+    col1.metric("記録の数", f"{len(records)}件")
+    col2.metric("イライラ度の平均", f"{sum(before) / len(before):.1f} → {sum(after) / len(after):.1f}")
+    col3.metric("話して軽くなった", f"{lowered} / {len(records)}件")
+
+    # グラフ
+    st.subheader("イライラしやすい場面")
+    st.altair_chart(bar_chart(Counter(r["場面"] for r in records), "場面"), width="stretch")
+    st.subheader("よく出てくる願い")
+    categories = Counter(r["願いの種類"] for r in records if r["願いの種類"])
+    if categories:
+        st.altair_chart(bar_chart(categories, "願いの種類"), width="stretch")
+        with st.expander("願いの言葉を見る"):
+            for category, _ in categories.most_common():
+                st.markdown(f"**{category}**")
+                for r in records:
+                    if r["願いの種類"] == category:
+                        st.markdown(f"- {r['願い']}（{r['場面']}）")
+
+    # 週のまとめ
+    st.subheader("週のまとめ")
+    weeks = sorted({week_start(r["日時"]) for r in records}, reverse=True)
+    start = st.selectbox("どの週をふりかえりますか？", weeks, format_func=week_label)
+    week_records = [r for r in records if week_start(r["日時"]) == start]
+    st.caption(f"この週の記録：{len(week_records)}件")
+    saved = load_weekly().get(start)
+    if saved:
+        st.markdown(saved)
+    if st.button("まとめを作り直す" if saved else "この週のまとめを作る", type="secondary" if saved else "primary"):
+        try:
+            with st.spinner("この週の記録を読んでいます…"):
+                text = make_weekly_summary(week_records)
+        except anthropic.APIError as e:
+            st.error(f"AIとの通信でエラーが起きました。少し待ってからもう一度押してください。（{e}）")
+            st.stop()
+        save_weekly(start, text)
+        st.rerun()
+
+
 st.set_page_config(page_title="イライラから本当の願いを発見するAI")
 
 # Streamlitのページは英語扱いのため、ブラウザが日本語を「翻訳」して文字が変わってしまう。
@@ -359,6 +579,7 @@ if APP_PASSWORD and not st.session_state.get("authenticated"):
 pages = [st.Page(talk_page, title="話す", default=True)]
 if not GUEST_MODE:
     pages.append(st.Page(history_page, title="履歴", url_path="history"))
+    pages.append(st.Page(review_page, title="ふりかえり", url_path="review"))
 page = st.navigation(
     pages,
     position="top" if len(pages) > 1 else "hidden",
