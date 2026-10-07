@@ -65,6 +65,7 @@ SYSTEM_PROMPT = """あなたは、仕事と子育てを両立している母親�
    - 選んだ願いと結びつけて、なぜそれが願いにつながるのかを一言そえる。
    - 「どれか一つ、できそうなものがあれば」と、やらなくてもいい前提で伝える。
    - 提案のあとは、問いを続けずに、ねぎらいの一言で会話を終える。
+   - 行動を提案したこの返答に限り、最後の行に [END] とだけ書く（アプリが記録の案内を出す合図で、本人には表示されない）。
 
 ## 守ること
 - イライラしたことを否定しない。まず共感する。
@@ -90,7 +91,9 @@ SUMMARY_PROMPT = """これから渡すのは、イライラした出来事につ
   「〜を大切にしたかった」の「〜」の部分を、20〜40字程度で。願いがまだ出ていなければ空文字。
 - actions: AIが提案した小さな行動を、1つ15字程度に短くしたもの。提案がなければ空のリスト。"""
 
-FIRST_MESSAGE = "こんにちは。最近イライラしたことを、そのまま書いてみてください。うまく書こうとしなくて大丈夫です。"
+END_MARK = "[END]"  # AIが会話を締めくくったときの合図
+
+FIRST_MESSAGE ="こんにちは。最近イライラしたことを、そのまま書いてみてください。うまく書こうとしなくて大丈夫です。"
 
 
 class Summary(BaseModel):
@@ -105,7 +108,8 @@ def get_client() -> anthropic.Anthropic:
 
 def ask_claude(messages: list[dict], scene: str) -> str:
     # 選んだ場面をAIにも伝える（画面の吹き出しには出さない）
-    api_messages = [dict(m) for m in messages]
+    # APIには役割と本文だけを渡す（"final" などアプリ用の情報は渡さない）
+    api_messages = [{"role": m["role"], "content": m["content"]} for m in messages]
     api_messages[0]["content"] = f"（場面：{scene}）\n{api_messages[0]['content']}"
     response = get_client().beta.messages.create(
         model=MODEL,
@@ -193,7 +197,10 @@ def talk_page() -> None:
 
     # 話し終えたら：今のイライラ度をつけて記録する
     saved = st.session_state.get("saved")
-    if len(messages) >= 2 and not saved:
+    # 願いのまとめと行動の提案が終わってから（AIが [END] の合図を出してから）表示する
+    # 合図が出ないまま長く続いたときも記録できるよう、5往復を超えたら表示する
+    concluded = any(m.get("final") for m in messages) or len(messages) >= 10
+    if concluded and not saved:
         with st.container(border=True):
             st.write("**話し終えたら、今の気持ちをつけて記録しましょう**")
             st.select_slider(
@@ -264,9 +271,11 @@ def talk_page() -> None:
                 messages.pop()
                 st.error(f"AIとの通信でエラーが起きました。少し待ってからもう一度送ってください。（{e}）")
                 st.stop()
+            final = END_MARK in reply
+            reply = reply.replace(END_MARK, "").strip()
             st.write(reply)
 
-        messages.append({"role": "assistant", "content": reply})
+        messages.append({"role": "assistant", "content": reply, "final": final})
         # 入力欄の案内文や記録ボタンを出すため、画面を描き直す
         st.rerun()
 
