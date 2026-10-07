@@ -17,6 +17,8 @@ RECORDS_FILE = Path(__file__).parent / "records.csv"
 COLUMNS = ["日時", "場面", "イライラ度（前）", "イライラ度（後）", "出来事", "願い", "行動"]
 SCENES = ["朝の支度", "食事", "寝かしつけ", "仕事", "パートナー", "その他"]
 LEVELS = {1: "1 ちょっとモヤッと", 2: "2 モヤモヤ", 3: "3 イライラ", 4: "4 かなりイライラ", 5: "5 爆発しそう"}
+# 話したあとは、いちばん軽い「1」を「すっきりした！」と表す（数字の意味は同じ）
+LEVELS_AFTER = {**LEVELS, 1: "1 すっきりした！"}
 
 # AIへの指示（要件定義書 3章・5章）
 SYSTEM_PROMPT = """あなたは、仕事と子育てを両立している母親の話を聞く、やさしい聞き手です。
@@ -204,8 +206,8 @@ def talk_page() -> None:
         with st.container(border=True):
             st.write("**話し終えたら、今の気持ちをつけて記録しましょう**")
             st.select_slider(
-                "今のイライラ度は？", options=list(LEVELS), value=st.session_state.before_value,
-                format_func=LEVELS.get, key="after",
+                "今のイライラ度は？", options=list(LEVELS_AFTER), value=st.session_state.before_value,
+                format_func=LEVELS_AFTER.get, key="after",
             )
             if st.button("記録して終わる", type="primary"):
                 try:
