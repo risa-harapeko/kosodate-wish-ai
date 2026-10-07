@@ -1,4 +1,6 @@
 import csv
+import hmac
+import os
 from datetime import datetime
 from pathlib import Path
 
@@ -9,6 +11,10 @@ from pydantic import BaseModel
 
 # .env の ANTHROPIC_API_KEY を読み込む（キーはコードに書かない）
 load_dotenv()
+
+# ネットに公開したときの設定（Streamlit Community Cloud の Secrets に書く。手元では未設定でよい）
+APP_PASSWORD = os.environ.get("APP_PASSWORD", "")  # 設定すると、パスワードを知っている人だけが使える
+GUEST_MODE = os.environ.get("GUEST_MODE") == "true"  # true にすると記録しない（他の人に試してもらう用）
 
 MODEL = "claude-sonnet-5-5"
 
@@ -80,8 +86,8 @@ SYSTEM_PROMPT = """あなたは、仕事と子育てを両立している母親�
 ## 危険な兆候への対応
 「消えたい」「死にたい」「子どもを叩いてしまいそう」など、本人や子どもの安全に関わる言葉が出たら、
 深掘りや問いかけをやめ、気持ちを受け止めたうえで、次のような相談窓口を案内する。
-- 児童相談所 虐待対応ダイヤル「189」
-- よりそいホットライン
+- 児童相談所 虐待対応ダイヤル「189」（24時間・通話料無料）
+- よりそいホットライン 0120-279-338（24時間・通話料無料）
 - 身近な人や医療機関に話すこと
 """
 
@@ -169,6 +175,16 @@ def talk_page() -> None:
     st.title("イライラから本当の願いを発見するAI")
     st.write("イライラの奥には、あなたの大切な「願い」が隠れています。AIと話しながら一緒に見つけてみましょう。")
     st.caption("※ これはセルフケアのツールで、医療やカウンセリングの代わりではありません。")
+    if GUEST_MODE:
+        st.caption(
+            "※ 書いた内容は、返事を作るためにAI（Anthropic社のClaude）に送られます。このアプリには保存されません。"
+            "お名前など、個人が特定できることは書かないでください。"
+        )
+    with st.expander("つらいときの相談先"):
+        st.markdown(
+            "- 児童相談所 虐待対応ダイヤル **189**（24時間・通話料無料・匿名可）\n"
+            "- よりそいホットライン **0120-279-338**（24時間・通話料無料）"
+        )
 
     if "messages" not in st.session_state:
         st.session_state.messages = []
@@ -204,12 +220,21 @@ def talk_page() -> None:
     concluded = any(m.get("final") for m in messages) or len(messages) >= 10
     if concluded and not saved:
         with st.container(border=True):
-            st.write("**話し終えたら、今の気持ちをつけて記録しましょう**")
+            if GUEST_MODE:
+                st.write("**話し終えたら、今の気持ちをつけてみましょう**")
+            else:
+                st.write("**話し終えたら、今の気持ちをつけて記録しましょう**")
             st.select_slider(
                 "今のイライラ度は？", options=list(LEVELS_AFTER), value=st.session_state.before_value,
                 format_func=LEVELS_AFTER.get, key="after",
             )
-            if st.button("記録して終わる", type="primary"):
+            if GUEST_MODE and st.button("気持ちの変化を見る", type="primary"):
+                # 他の人が使うときは保存しない
+                st.session_state.saved = {
+                    "before": st.session_state.before_value, "after": st.session_state.after, "wish": "",
+                }
+                st.rerun()
+            if not GUEST_MODE and st.button("記録して終わる", type="primary"):
                 try:
                     with st.spinner("記録しています…"):
                         summary = summarize(messages)
@@ -235,16 +260,21 @@ def talk_page() -> None:
     if saved:
         diff = saved["before"] - saved["after"]
         change = f"{diff}下がりました" if diff > 0 else ("変わりませんでした" if diff == 0 else f"{-diff}上がりました")
-        message = f"記録しました。イライラ度は {saved['before']} → {saved['after']}（{change}）。"
+        message = f"イライラ度は {saved['before']} → {saved['after']}（{change}）。"
+        if not GUEST_MODE:
+            message = "記録しました。" + message
         if saved["wish"]:
             message += f"\n\n今日見つかった願い：{saved['wish']}"
         st.success(message)
-        st.caption("「新しく話す」で次の会話を始められます。これまでの記録は上の「履歴」で見られます。")
+        if GUEST_MODE:
+            st.caption("使ってくださってありがとうございました。「新しく話す」で、もう一度話せます。")
+        else:
+            st.caption("「新しく話す」で次の会話を始められます。これまでの記録は上の「履歴」で見られます。")
 
     # 入力欄
     scene = st.session_state.get("scene") if not messages else st.session_state.scene_value
     if saved:
-        placeholder = "記録しました。「新しく話す」で次の会話を始められます"
+        placeholder = "「新しく話す」で次の会話を始められます"
     elif not scene:
         placeholder = "まず、上で場面を選んでください"
     elif messages:
@@ -313,8 +343,22 @@ st.iframe(
     height=1,
 )
 
+# パスワードが設定されているときは、正しいパスワードを入れた人だけが使える
+if APP_PASSWORD and not st.session_state.get("authenticated"):
+    st.title("イライラから本当の願いを発見するAI")
+    password = st.text_input("パスワードを入力してください", type="password")
+    if password:
+        if hmac.compare_digest(password, APP_PASSWORD):
+            st.session_state.authenticated = True
+            st.rerun()
+        st.error("パスワードが違います。")
+    st.stop()
+
+pages = [st.Page(talk_page, title="話す", default=True)]
+if not GUEST_MODE:
+    pages.append(st.Page(history_page, title="履歴", url_path="history"))
 page = st.navigation(
-    [st.Page(talk_page, title="話す", default=True), st.Page(history_page, title="履歴", url_path="history")],
-    position="top",
+    pages,
+    position="top" if len(pages) > 1 else "hidden",
 )
 page.run()

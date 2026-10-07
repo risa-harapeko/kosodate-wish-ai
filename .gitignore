@@ -1,3 +1,4 @@
 .env
 __pycache__/
 records.csv
+secrets_for_cloud.txt
