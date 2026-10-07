@@ -1,12 +1,22 @@
+import csv
+from datetime import datetime
+from pathlib import Path
+
 import anthropic
 import streamlit as st
-import streamlit.components.v1 as components
 from dotenv import load_dotenv
+from pydantic import BaseModel
 
 # .env の ANTHROPIC_API_KEY を読み込む（キーはコードに書かない）
 load_dotenv()
 
 MODEL = "claude-sonnet-5-5"
+
+# 記録の保存先（個人的な内容なので .gitignore でGitHubに上げない）
+RECORDS_FILE = Path(__file__).parent / "records.csv"
+COLUMNS = ["日時", "場面", "イライラ度（前）", "イライラ度（後）", "出来事", "願い", "行動"]
+SCENES = ["朝の支度", "食事", "寝かしつけ", "仕事", "パートナー", "その他"]
+LEVELS = {1: "1 ちょっとモヤッと", 2: "2 モヤモヤ", 3: "3 イライラ", 4: "4 かなりイライラ", 5: "5 爆発しそう"}
 
 # AIへの指示（要件定義書 3章・5章）
 SYSTEM_PROMPT = """あなたは、仕事と子育てを両立している母親の話を聞く、やさしい聞き手です。
@@ -72,7 +82,20 @@ SYSTEM_PROMPT = """あなたは、仕事と子育てを両立している母親�
 - 身近な人や医療機関に話すこと
 """
 
+
+# 記録用に、会話から「願い」と「行動」を決まった形で取り出すための指示
+SUMMARY_PROMPT = """これから渡すのは、イライラした出来事について、本人とAIが話した会話です。
+記録のために、次の2つを取り出してください。
+- wish: 本人が「しっくりくる」と選んだ願い。選んでいなければ、AIが示した願いのうち中心となるもの。
+  「〜を大切にしたかった」の「〜」の部分を、20〜40字程度で。願いがまだ出ていなければ空文字。
+- actions: AIが提案した小さな行動を、1つ15字程度に短くしたもの。提案がなければ空のリスト。"""
+
 FIRST_MESSAGE = "こんにちは。最近イライラしたことを、そのまま書いてみてください。うまく書こうとしなくて大丈夫です。"
+
+
+class Summary(BaseModel):
+    wish: str
+    actions: list[str]
 
 
 @st.cache_resource
@@ -80,12 +103,15 @@ def get_client() -> anthropic.Anthropic:
     return anthropic.Anthropic()
 
 
-def ask_claude(messages: list[dict]) -> str:
+def ask_claude(messages: list[dict], scene: str) -> str:
+    # 選んだ場面をAIにも伝える（画面の吹き出しには出さない）
+    api_messages = [dict(m) for m in messages]
+    api_messages[0]["content"] = f"（場面：{scene}）\n{api_messages[0]['content']}"
     response = get_client().beta.messages.create(
         model=MODEL,
         max_tokens=16000,
         system=SYSTEM_PROMPT,
-        messages=messages,
+        messages=api_messages,
         output_config={"effort": "medium"},
         # 安全上の理由で応答が止まったとき、サーバー側で別モデルに切り替える
         betas=["server-side-fallback-2026-07-01"],
@@ -96,62 +122,188 @@ def ask_claude(messages: list[dict]) -> str:
     return "".join(b.text for b in response.content if b.type == "text")
 
 
+def summarize(messages: list[dict]) -> Summary:
+    transcript = "\n".join(
+        f"{'本人' if m['role'] == 'user' else 'AI'}：{m['content']}" for m in messages
+    )
+    response = get_client().messages.parse(
+        model=MODEL,
+        max_tokens=4000,
+        system=SUMMARY_PROMPT,
+        messages=[{"role": "user", "content": transcript}],
+        output_format=Summary,
+    )
+    return response.parsed_output or Summary(wish="", actions=[])
+
+
+def save_record(row: dict) -> None:
+    # Excelで文字化けしないよう、新しく作るときだけBOM付きUTF-8にする
+    is_new = not RECORDS_FILE.exists()
+    with open(RECORDS_FILE, "w" if is_new else "a", encoding="utf-8-sig" if is_new else "utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=COLUMNS)
+        if is_new:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def load_records() -> list[dict]:
+    if not RECORDS_FILE.exists():
+        return []
+    with open(RECORDS_FILE, encoding="utf-8-sig", newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def reset_conversation() -> None:
+    st.session_state.messages = []
+    for key in ["scene", "before", "after", "scene_value", "before_value", "saved"]:
+        st.session_state.pop(key, None)
+
+
+def talk_page() -> None:
+    st.title("イライラから本当の願いを発見するAI")
+    st.write("イライラの奥には、あなたの大切な「願い」が隠れています。AIと話しながら一緒に見つけてみましょう。")
+    st.caption("※ これはセルフケアのツールで、医療やカウンセリングの代わりではありません。")
+
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+
+    if st.button("新しく話す"):
+        reset_conversation()
+        st.rerun()
+
+    messages = st.session_state.messages
+
+    # 話す前：場面とイライラ度を選ぶ
+    if not messages:
+        st.segmented_control("どんな場面でしたか？", SCENES, key="scene")
+        st.select_slider(
+            "今のイライラ度は？", options=list(LEVELS), value=3, format_func=LEVELS.get, key="before"
+        )
+    else:
+        st.caption(
+            f"場面：{st.session_state.scene_value}　／　話す前のイライラ度：{LEVELS[st.session_state.before_value]}"
+        )
+
+    # これまでの会話を表示
+    with st.chat_message("assistant"):
+        st.write(FIRST_MESSAGE)
+    for m in messages:
+        with st.chat_message(m["role"]):
+            st.write(m["content"])
+
+    # 話し終えたら：今のイライラ度をつけて記録する
+    saved = st.session_state.get("saved")
+    if len(messages) >= 2 and not saved:
+        with st.container(border=True):
+            st.write("**話し終えたら、今の気持ちをつけて記録しましょう**")
+            st.select_slider(
+                "今のイライラ度は？", options=list(LEVELS), value=st.session_state.before_value,
+                format_func=LEVELS.get, key="after",
+            )
+            if st.button("記録して終わる", type="primary"):
+                try:
+                    with st.spinner("記録しています…"):
+                        summary = summarize(messages)
+                except anthropic.APIError as e:
+                    st.error(f"記録のまとめでエラーが起きました。少し待ってからもう一度押してください。（{e}）")
+                    st.stop()
+                save_record({
+                    "日時": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    "場面": st.session_state.scene_value,
+                    "イライラ度（前）": st.session_state.before_value,
+                    "イライラ度（後）": st.session_state.after,
+                    "出来事": messages[0]["content"],
+                    "願い": summary.wish,
+                    "行動": " / ".join(summary.actions),
+                })
+                st.session_state.saved = {
+                    "before": st.session_state.before_value,
+                    "after": st.session_state.after,
+                    "wish": summary.wish,
+                }
+                st.rerun()
+
+    if saved:
+        diff = saved["before"] - saved["after"]
+        change = f"{diff}下がりました" if diff > 0 else ("変わりませんでした" if diff == 0 else f"{-diff}上がりました")
+        message = f"記録しました。イライラ度は {saved['before']} → {saved['after']}（{change}）。"
+        if saved["wish"]:
+            message += f"\n\n今日見つかった願い：{saved['wish']}"
+        st.success(message)
+        st.caption("「新しく話す」で次の会話を始められます。これまでの記録は上の「履歴」で見られます。")
+
+    # 入力欄
+    scene = st.session_state.get("scene") if not messages else st.session_state.scene_value
+    if saved:
+        placeholder = "記録しました。「新しく話す」で次の会話を始められます"
+    elif not scene:
+        placeholder = "まず、上で場面を選んでください"
+    elif messages:
+        placeholder = "答えを書いてください"
+    else:
+        placeholder = "イライラしたできごとを書いてください"
+
+    if prompt := st.chat_input(placeholder, disabled=bool(saved) or not scene):
+        if not messages:
+            # 入力欄が消えると選んだ値も消えるため、別の場所に写しておく
+            st.session_state.scene_value = st.session_state.scene
+            st.session_state.before_value = st.session_state.before
+        messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.write(prompt)
+
+        with st.chat_message("assistant"):
+            try:
+                with st.spinner("考えています…"):
+                    reply = ask_claude(messages, st.session_state.scene_value)
+            except anthropic.AuthenticationError:
+                messages.pop()
+                st.error("APIキーが正しくないようです。.env の ANTHROPIC_API_KEY を確認してください。")
+                st.stop()
+            except anthropic.APIError as e:
+                messages.pop()
+                st.error(f"AIとの通信でエラーが起きました。少し待ってからもう一度送ってください。（{e}）")
+                st.stop()
+            st.write(reply)
+
+        messages.append({"role": "assistant", "content": reply})
+        # 入力欄の案内文や記録ボタンを出すため、画面を描き直す
+        st.rerun()
+
+
+def history_page() -> None:
+    st.title("履歴")
+    records = load_records()
+    if not records:
+        st.info("まだ記録がありません。「話す」で会話をして、最後に「記録して終わる」を押すと、ここにたまっていきます。")
+        return
+
+    records.reverse()  # 新しい順
+    avg_before = sum(int(r["イライラ度（前）"]) for r in records) / len(records)
+    avg_after = sum(int(r["イライラ度（後）"]) for r in records) / len(records)
+    col1, col2 = st.columns(2)
+    col1.metric("記録の数", f"{len(records)}件")
+    col2.metric("イライラ度の平均（話す前 → 後）", f"{avg_before:.1f} → {avg_after:.1f}")
+    st.dataframe(records, hide_index=True, width="stretch")
+    st.caption(f"記録は {RECORDS_FILE.name} に保存されています（Excelでも開けます）。")
+
+
 st.set_page_config(page_title="イライラから本当の願いを発見するAI")
 
 # Streamlitのページは英語扱いのため、ブラウザが日本語を「翻訳」して文字が変わってしまう。
 # ページを日本語・翻訳不要として登録し直す。
-components.html(
+st.iframe(
     """<script>
     const root = window.parent.document.documentElement;
     root.lang = "ja";
     root.setAttribute("translate", "no");
     root.classList.add("notranslate");
     </script>""",
-    height=0,
+    height=1,
 )
 
-# ヘッダー
-st.title("イライラから本当の願いを発見するAI")
-st.write("イライラの奥には、あなたの大切な「願い」が隠れています。AIと話しながら一緒に見つけてみましょう。")
-st.caption("※ これはセルフケアのツールで、医療やカウンセリングの代わりではありません。")
-
-# 「新しく話す」ボタンで会話をリセット
-if st.button("新しく話す"):
-    st.session_state.messages = []
-    st.rerun()
-
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-
-# これまでの会話を表示
-with st.chat_message("assistant"):
-    st.write(FIRST_MESSAGE)
-for m in st.session_state.messages:
-    with st.chat_message(m["role"]):
-        st.write(m["content"])
-
-# 入力欄
-if prompt := st.chat_input(
-    "答えを書いてください" if st.session_state.messages else "イライラしたできごとを書いてください"
-):
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.write(prompt)
-
-    with st.chat_message("assistant"):
-        try:
-            with st.spinner("考えています…"):
-                reply = ask_claude(st.session_state.messages)
-        except anthropic.AuthenticationError:
-            st.session_state.messages.pop()
-            st.error("APIキーが正しくないようです。.env の ANTHROPIC_API_KEY を確認してください。")
-            st.stop()
-        except anthropic.APIError as e:
-            st.session_state.messages.pop()
-            st.error(f"AIとの通信でエラーが起きました。少し待ってからもう一度送ってください。（{e}）")
-            st.stop()
-        st.write(reply)
-
-    st.session_state.messages.append({"role": "assistant", "content": reply})
-    # 入力欄の案内文を「答えを書いてください」に切り替えるため、画面を描き直す
-    st.rerun()
+page = st.navigation(
+    [st.Page(talk_page, title="話す", default=True), st.Page(history_page, title="履歴", url_path="history")],
+    position="top",
+)
+page.run()
