@@ -346,8 +346,10 @@ st.iframe(
 # パスワードが設定されているときは、正しいパスワードを入れた人だけが使える
 if APP_PASSWORD and not st.session_state.get("authenticated"):
     st.title("イライラから本当の願いを発見するAI")
-    password = st.text_input("パスワードを入力してください", type="password")
-    if password:
+    with st.form("login"):
+        password = st.text_input("パスワードを入力してください", type="password")
+        submitted = st.form_submit_button("入る", type="primary")
+    if submitted:
         if hmac.compare_digest(password, APP_PASSWORD):
             st.session_state.authenticated = True
             st.rerun()
