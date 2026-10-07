@@ -1,5 +1,6 @@
 import csv
 import hmac
+import io
 import json
 import os
 from collections import Counter
@@ -19,7 +20,8 @@ load_dotenv()
 
 # ネットに公開したときの設定（Streamlit Community Cloud の Secrets に書く。手元では未設定でよい）
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "")  # 設定すると、パスワードを知っている人だけが使える
-GUEST_MODE = os.environ.get("GUEST_MODE") == "true"  # true にすると記録しない（他の人に試してもらう用）
+# true にすると公開版の動きになる：記録は使った人のブラウザの中だけに保存し、アプリ（作者）には残さない
+PUBLIC_MODE = os.environ.get("GUEST_MODE") == "true"
 
 MODEL = "claude-sonnet-5-5"
 
@@ -226,6 +228,9 @@ def classify_wishes(wishes: list[str]) -> list[str]:
 
 
 def write_records(records: list[dict]) -> None:
+    if PUBLIC_MODE:
+        st.session_state.browser_records = records
+        return
     # Excelで文字化けしないよう、BOM付きUTF-8で書く
     with open(RECORDS_FILE, "w", encoding="utf-8-sig", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=COLUMNS, extrasaction="ignore")
@@ -239,14 +244,64 @@ def save_record(row: dict) -> None:
 
 
 def load_records() -> list[dict]:
-    if not RECORDS_FILE.exists():
+    if PUBLIC_MODE:
+        records = [dict(r) for r in st.session_state.get("browser_records", [])]
+    elif not RECORDS_FILE.exists():
         return []
-    with open(RECORDS_FILE, encoding="utf-8-sig", newline="") as f:
-        records = list(csv.DictReader(f))
+    else:
+        with open(RECORDS_FILE, encoding="utf-8-sig", newline="") as f:
+            records = list(csv.DictReader(f))
     for r in records:  # あとから増えた項目は空にしておく
         for col in COLUMNS:
             r[col] = r.get(col) or ""
     return records
+
+
+# 公開版の記録は、使った人のブラウザ（localStorage）に保存する。サーバーやアプリの作者には残らない
+BROWSER_STORE_JS = """
+export default function(component) {
+    const { data, setStateValue } = component;
+    if (data.write !== null) {
+        localStorage.setItem(data.key, data.write);
+    }
+    setStateValue("value", localStorage.getItem(data.key) ?? "");
+}
+"""
+_browser_store = st.components.v2.component("browser_store", js=BROWSER_STORE_JS)
+
+
+def browser_store(name: str, content) -> str | None:
+    # content を渡すとブラウザに書き込み、ブラウザに今ある中身を返す（読み込み前は None）
+    write = None if content is None else json.dumps(content, ensure_ascii=False)
+    result = _browser_store(
+        key=f"store_{name}",
+        data={"key": f"kosodate_{name}_v1", "write": write},
+        default={"value": None},
+        on_value_change=lambda: None,
+    )
+    return result.value
+
+
+def sync_browser_storage() -> None:
+    loaded = st.session_state.get("browser_loaded", False)
+    records = browser_store("records", st.session_state.browser_records if loaded else None)
+    weekly = browser_store("weekly", st.session_state.browser_weekly if loaded else None)
+    if not loaded:
+        if records is None or weekly is None:
+            st.caption("記録を読み込んでいます…")
+            st.stop()
+        st.session_state.browser_records = json.loads(records) if records else []
+        st.session_state.browser_weekly = json.loads(weekly) if weekly else {}
+        st.session_state.browser_loaded = True
+        st.rerun()
+
+
+def records_to_csv(records: list[dict]) -> bytes:
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=COLUMNS, extrasaction="ignore")
+    writer.writeheader()
+    writer.writerows(records)
+    return buffer.getvalue().encode("utf-8-sig")  # Excelで文字化けしないようBOM付き
 
 
 def week_start(date_text: str) -> str:
@@ -262,6 +317,8 @@ def week_label(start: str) -> str:
 
 
 def load_weekly() -> dict:
+    if PUBLIC_MODE:
+        return dict(st.session_state.get("browser_weekly", {}))
     if not WEEKLY_FILE.exists():
         return {}
     return json.loads(WEEKLY_FILE.read_text(encoding="utf-8"))
@@ -270,6 +327,9 @@ def load_weekly() -> dict:
 def save_weekly(start: str, text: str) -> None:
     weekly = load_weekly()
     weekly[start] = text
+    if PUBLIC_MODE:
+        st.session_state.browser_weekly = weekly
+        return
     WEEKLY_FILE.write_text(json.dumps(weekly, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
@@ -334,9 +394,10 @@ def talk_page() -> None:
     st.title("イライラから本当の願いを発見するAI")
     st.write("イライラの奥には、あなたの大切な「願い」が隠れています。AIと話しながら一緒に見つけてみましょう。")
     st.caption("※ これはセルフケアのツールで、医療やカウンセリングの代わりではありません。")
-    if GUEST_MODE:
+    if PUBLIC_MODE:
         st.caption(
-            "※ 書いた内容は、返事を作るためにAI（Anthropic社のClaude）に送られます。このアプリには保存されません。"
+            "※ 書いた内容は、返事を作るためにAI（Anthropic社のClaude）に送られます。"
+            "記録はこの端末のブラウザの中だけに保存され、アプリの作者を含め他の人は見られません。"
             "お名前など、個人が特定できることは書かないでください。"
         )
     with st.expander("つらいときの相談先"):
@@ -379,21 +440,12 @@ def talk_page() -> None:
     concluded = any(m.get("final") for m in messages) or len(messages) >= 10
     if concluded and not saved:
         with st.container(border=True):
-            if GUEST_MODE:
-                st.write("**話し終えたら、今の気持ちをつけてみましょう**")
-            else:
-                st.write("**話し終えたら、今の気持ちをつけて記録しましょう**")
+            st.write("**話し終えたら、今の気持ちをつけて記録しましょう**")
             st.select_slider(
                 "今のイライラ度は？", options=list(LEVELS_AFTER), value=st.session_state.before_value,
                 format_func=LEVELS_AFTER.get, key="after",
             )
-            if GUEST_MODE and st.button("気持ちの変化を見る", type="primary"):
-                # 他の人が使うときは保存しない
-                st.session_state.saved = {
-                    "before": st.session_state.before_value, "after": st.session_state.after, "wish": "",
-                }
-                st.rerun()
-            if not GUEST_MODE and st.button("記録して終わる", type="primary"):
+            if st.button("記録して終わる", type="primary"):
                 try:
                     with st.spinner("記録しています…"):
                         summary = summarize(messages)
@@ -420,16 +472,11 @@ def talk_page() -> None:
     if saved:
         diff = saved["before"] - saved["after"]
         change = f"{diff}下がりました" if diff > 0 else ("変わりませんでした" if diff == 0 else f"{-diff}上がりました")
-        message = f"イライラ度は {saved['before']} → {saved['after']}（{change}）。"
-        if not GUEST_MODE:
-            message = "記録しました。" + message
+        message = f"記録しました。イライラ度は {saved['before']} → {saved['after']}（{change}）。"
         if saved["wish"]:
             message += f"\n\n今日見つかった願い：{saved['wish']}"
         st.success(message)
-        if GUEST_MODE:
-            st.caption("使ってくださってありがとうございました。「新しく話す」で、もう一度話せます。")
-        else:
-            st.caption("「新しく話す」で次の会話を始められます。これまでの記録は上の「履歴」で見られます。")
+        st.caption("「新しく話す」で次の会話を始められます。これまでの記録は上の「履歴」で見られます。")
 
     # 入力欄
     scene = st.session_state.get("scene") if not messages else st.session_state.scene_value
@@ -477,16 +524,33 @@ def history_page() -> None:
     records = load_records()
     if not records:
         st.info("まだ記録がありません。「話す」で会話をして、最後に「記録して終わる」を押すと、ここにたまっていきます。")
-        return
+    else:
+        avg_before = sum(int(r["イライラ度（前）"]) for r in records) / len(records)
+        avg_after = sum(int(r["イライラ度（後）"]) for r in records) / len(records)
+        col1, col2 = st.columns(2)
+        col1.metric("記録の数", f"{len(records)}件")
+        col2.metric("イライラ度の平均（話す前 → 後）", f"{avg_before:.1f} → {avg_after:.1f}")
+        st.dataframe(records[::-1], hide_index=True, width="stretch")  # 新しい順
+        st.download_button(
+            "記録をダウンロード（バックアップ）", records_to_csv(records),
+            file_name=f"irairadiary_{datetime.now():%Y%m%d}.csv", mime="text/csv",
+        )
 
-    records.reverse()  # 新しい順
-    avg_before = sum(int(r["イライラ度（前）"]) for r in records) / len(records)
-    avg_after = sum(int(r["イライラ度（後）"]) for r in records) / len(records)
-    col1, col2 = st.columns(2)
-    col1.metric("記録の数", f"{len(records)}件")
-    col2.metric("イライラ度の平均（話す前 → 後）", f"{avg_before:.1f} → {avg_after:.1f}")
-    st.dataframe(records, hide_index=True, width="stretch")
-    st.caption(f"記録は {RECORDS_FILE.name} に保存されています（Excelでも開けます）。")
+    if PUBLIC_MODE:
+        st.caption(
+            "記録はこの端末のブラウザの中だけに保存されています。アプリの作者を含め、他の人は見られません。"
+            "ブラウザのデータを消したり、機種変更したりすると記録も消えるので、ときどきダウンロードしておくと安心です。"
+        )
+        with st.expander("バックアップから記録を戻す"):
+            uploaded = st.file_uploader("ダウンロードした記録のファイル（.csv）を選んでください", type="csv")
+            if uploaded is not None and st.button("この記録を戻す"):
+                restored = list(csv.DictReader(io.StringIO(uploaded.getvalue().decode("utf-8-sig"))))
+                # 同じ記録が二重にならないよう、日時と出来事が同じものは1つにまとめる
+                merged = {(r["日時"], r["出来事"]): r for r in records + restored}
+                write_records(sorted(merged.values(), key=lambda r: r["日時"]))
+                st.rerun()  # 画面を描き直すと、ブラウザにも保存される
+    elif records:
+        st.caption(f"記録は {RECORDS_FILE.name} に保存されています（Excelでも開けます）。")
 
 
 def review_page() -> None:
@@ -577,9 +641,11 @@ if APP_PASSWORD and not st.session_state.get("authenticated"):
     st.stop()
 
 pages = [st.Page(talk_page, title="話す", default=True)]
-if not GUEST_MODE:
-    pages.append(st.Page(history_page, title="履歴", url_path="history"))
-    pages.append(st.Page(review_page, title="ふりかえり", url_path="review"))
+pages.append(st.Page(history_page, title="履歴", url_path="history"))
+pages.append(st.Page(review_page, title="ふりかえり", url_path="review"))
+
+if PUBLIC_MODE:
+    sync_browser_storage()
 page = st.navigation(
     pages,
     position="top" if len(pages) > 1 else "hidden",
