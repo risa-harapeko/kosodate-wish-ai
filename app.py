@@ -428,6 +428,18 @@ def talk_page() -> None:
 
     messages = st.session_state.messages
 
+    # 先週の記録があって、まだ週のまとめを作っていなければ知らせる
+    if not messages:
+        today = datetime.now()
+        last_week = (today - timedelta(days=today.weekday() + 7)).strftime("%Y-%m-%d")
+        last_week_count = sum(1 for r in load_records() if week_start(r["日時"]) == last_week)
+        if last_week_count and last_week not in load_weekly():
+            with st.container(border=True):
+                st.write(f"先週（{week_label(last_week).removesuffix('の週')}）の記録が{last_week_count}件あります。先週のまとめを作ってみませんか？")
+                if st.button("先週をふりかえる"):
+                    st.session_state.review_week = last_week
+                    st.switch_page(REVIEW_PAGE)
+
     # 話す前：場面とイライラ度を選ぶ
     if not messages:
         st.segmented_control("どんな場面でしたか？", SCENES, key="scene")
@@ -489,7 +501,16 @@ def talk_page() -> None:
         if saved["wish"]:
             message += f"\n\n今日見つかった願い：{saved['wish']}"
         st.success(message)
-        st.caption("「新しく話す」で次の会話を始められます。これまでの記録は上の「履歴」で見られます。")
+        # スマホでは上のタブを見落としやすいので、記録した直後に行き先を案内する
+        count = len(load_records())
+        if count == 3 or (count > 0 and count % 10 == 0):
+            st.info(f"記録が{count}件たまりました。「ふりかえり」で、イライラしやすい場面やよく出てくる願いを見てみませんか？")
+        col1, col2 = st.columns(2)
+        if col1.button("履歴を見る", width="stretch"):
+            st.switch_page(HISTORY_PAGE)
+        if col2.button("ふりかえりを見る", width="stretch"):
+            st.switch_page(REVIEW_PAGE)
+        st.caption("「新しく話す」で次の会話を始められます。")
 
     # 入力欄
     scene = st.session_state.get("scene") if not messages else st.session_state.scene_value
@@ -627,7 +648,9 @@ def review_page() -> None:
     # 週のまとめ
     st.subheader("週のまとめ")
     weeks = sorted({week_start(r["日時"]) for r in records}, reverse=True)
-    start = st.selectbox("どの週をふりかえりますか？", weeks, format_func=week_label)
+    if st.session_state.get("review_week") not in weeks:
+        st.session_state.pop("review_week", None)
+    start = st.selectbox("どの週をふりかえりますか？", weeks, format_func=week_label, key="review_week")
     week_records = [r for r in records if week_start(r["日時"]) == start]
     st.caption(f"この週の記録：{len(week_records)}件")
     saved = load_weekly().get(start)
@@ -671,9 +694,9 @@ if APP_PASSWORD and not st.session_state.get("authenticated"):
         st.error("パスワードが違います。")
     st.stop()
 
-pages = [st.Page(talk_page, title="話す", default=True)]
-pages.append(st.Page(history_page, title="履歴", url_path="history"))
-pages.append(st.Page(review_page, title="ふりかえり", url_path="review"))
+HISTORY_PAGE = st.Page(history_page, title="履歴", url_path="history")
+REVIEW_PAGE = st.Page(review_page, title="ふりかえり", url_path="review")
+pages = [st.Page(talk_page, title="話す", default=True), HISTORY_PAGE, REVIEW_PAGE]
 
 if PUBLIC_MODE:
     sync_browser_storage()
