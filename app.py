@@ -3,6 +3,7 @@ import hmac
 import io
 import json
 import os
+import random
 from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -69,12 +70,12 @@ SYSTEM_PROMPT = """あなたは、仕事と子育てを両立している母親�
   自分自身の願い（「朝に一人で焦らなくていい安心がほしい」「自分だけが頑張っている感じから抜けたい」）まで掘る。
 
 ## 問いのかけ方
-事実確認（「何時に起きましたか？」）ではなく、本人が自分では考えたことのない角度の問いを選ぶ。例：
-- そのとき、心の中でどんな言葉がよぎっていましたか？
-- 同じことが起きても、イライラしない日もありますか？その日は何が違いますか？
-- もしそれが魔法のように解決したら、浮いた時間や気持ちで何をしたいですか？
-- そのイライラ、本当は誰に、どんなことをわかってほしかったのでしょう？
-- 子どもの頃、同じような場面で、誰かにしてほしかったことはありますか？
+事実確認（「何時に起きましたか？」）ではなく、本人が自分では考えたことのない角度の問いを選ぶ。
+- 相手の話に出てきた具体的な言葉や場面（「お迎えのとき」「LINEの一言」など）に触れてから問う。
+  どの相談にもそのまま使える、決まり文句のような問いにしない。
+- 会話の最初に「今回の問いの切り口」が渡される。話の内容に合うものを選び、言い回しは自分の言葉にする。
+  合うものがなければ、別の角度を考えてよい。
+- 2回目の問いは、1回目と違う切り口にする。
 
 ## 進め方
 1. 最初の返答では、まず気持ちを受け止めて共感し、そのあと問いを1つだけ返す。
@@ -147,6 +148,26 @@ WEEKLY_PROMPT = """あなたは、仕事と子育てを両立している母親�
 記録に「消えたい」「子どもを叩いてしまいそう」など安全に関わる内容があれば、まとめより先に気持ちを受け止め、
 児童相談所 虐待対応ダイヤル「189」やよりそいホットライン 0120-279-338（どちらも24時間・無料）を案内する。"""
 
+# 問いの切り口。毎回同じような問いにならないよう、会話ごとにこの中から4つを選んでAIに渡す
+QUESTION_ANGLES = [
+    "心の声：そのとき、心の中でどんな言葉がよぎっていたか",
+    "体の感覚：そのとき、体のどこに力が入っていたか、どんな感じがしたか",
+    "例外：同じことが起きてもイライラしない日はあるか、その日は何が違うか",
+    "理想の場面：その場面が思いどおりにいったら、どんな様子だったか",
+    "ほしかった一言：相手から、本当はどんな一言がほしかったか",
+    "言いたかった一言：何を言っても大丈夫だとしたら、相手に何と言いたかったか",
+    "友だちの目：同じことを友だちが話してくれたら、その友だちに何と声をかけるか",
+    "守りたかったもの：その場面で、いちばん守りたかったものは何か",
+    "奪われた感じ：その出来事で、いちばん奪われた感じがしたもの（時間・気持ち・ペースなど）は何か",
+    "くり返し：前にも似たイライラがあったか、そのときとの共通点は何か",
+    "余裕：もしその日あと30分余裕があったら、同じ場面はどう違っていたか",
+    "役割：そのとき「母」「妻」「働く自分」「ひとりの自分」のどの気持ちが強かったか",
+    "たとえ：そのときの気持ちを天気や色にたとえると何か",
+    "未来の自分：1年後の自分がこの場面を見たら、今の自分に何と言いそうか",
+    "子どもの頃：子どもの頃、似た場面で誰かにしてほしかったことはあるか",
+    "魔法：それが魔法のように解決したら、浮いた時間や気持ちで何をしたいか",
+]
+
 END_MARK = "[END]"  # AIが会話を締めくくったときの合図
 
 FIRST_MESSAGE ="こんにちは。最近イライラしたことを、そのまま書いてみてください。うまく書こうとしなくて大丈夫です。"
@@ -167,11 +188,14 @@ def get_client() -> anthropic.Anthropic:
     return anthropic.Anthropic()
 
 
-def ask_claude(messages: list[dict], scene: str) -> str:
-    # 選んだ場面をAIにも伝える（画面の吹き出しには出さない）
+def ask_claude(messages: list[dict], scene: str, angles: list[str]) -> str:
+    # 選んだ場面と今回の問いの切り口をAIにも伝える（画面の吹き出しには出さない）
     # APIには役割と本文だけを渡す（"final" などアプリ用の情報は渡さない）
     api_messages = [{"role": m["role"], "content": m["content"]} for m in messages]
-    api_messages[0]["content"] = f"（場面：{scene}）\n{api_messages[0]['content']}"
+    angle_text = "\n".join(f"- {a}" for a in angles)
+    api_messages[0]["content"] = (
+        f"（場面：{scene}）\n（今回の問いの切り口：\n{angle_text}）\n{api_messages[0]['content']}"
+    )
     response = get_client().beta.messages.create(
         model=MODEL,
         max_tokens=16000,
@@ -386,7 +410,7 @@ def bar_chart(counts: Counter, label: str) -> alt.Chart:
 
 def reset_conversation() -> None:
     st.session_state.messages = []
-    for key in ["scene", "before", "after", "scene_value", "before_value", "saved"]:
+    for key in ["scene", "before", "after", "scene_value", "before_value", "saved", "angles"]:
         st.session_state.pop(key, None)
 
 
@@ -399,11 +423,6 @@ def talk_page() -> None:
             "※ 書いた内容は、返事を作るためにAI（Anthropic社のClaude）に送られます。"
             "記録はこの端末のブラウザの中だけに保存され、アプリの作者を含め他の人は見られません。"
             "お名前など、個人が特定できることは書かないでください。"
-        )
-    with st.expander("つらいときの相談先"):
-        st.markdown(
-            "- 児童相談所 虐待対応ダイヤル **189**（24時間・通話料無料・匿名可）\n"
-            "- よりそいホットライン **0120-279-338**（24時間・通話料無料）"
         )
 
     if "messages" not in st.session_state:
@@ -478,6 +497,13 @@ def talk_page() -> None:
         st.success(message)
         st.caption("「新しく話す」で次の会話を始められます。これまでの記録は上の「履歴」で見られます。")
 
+    # 相談先は、会話のじゃまにならないよう画面の下に置く
+    with st.expander("つらいときの相談先"):
+        st.markdown(
+            "- 児童相談所 虐待対応ダイヤル **189**（24時間・通話料無料・匿名可）\n"
+            "- よりそいホットライン **0120-279-338**（24時間・通話料無料）"
+        )
+
     # 入力欄
     scene = st.session_state.get("scene") if not messages else st.session_state.scene_value
     if saved:
@@ -494,6 +520,7 @@ def talk_page() -> None:
             # 入力欄が消えると選んだ値も消えるため、別の場所に写しておく
             st.session_state.scene_value = st.session_state.scene
             st.session_state.before_value = st.session_state.before
+            st.session_state.angles = random.sample(QUESTION_ANGLES, 4)
         messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.write(prompt)
@@ -501,7 +528,7 @@ def talk_page() -> None:
         with st.chat_message("assistant"):
             try:
                 with st.spinner("考えています…"):
-                    reply = ask_claude(messages, st.session_state.scene_value)
+                    reply = ask_claude(messages, st.session_state.scene_value, st.session_state.angles)
             except anthropic.AuthenticationError:
                 messages.pop()
                 st.error("APIキーが正しくないようです。.env の ANTHROPIC_API_KEY を確認してください。")
