@@ -418,12 +418,6 @@ def talk_page() -> None:
     st.title("イライラから本当の願いを発見するAI")
     st.write("イライラの奥には、あなたの大切な「願い」が隠れています。AIと話しながら一緒に見つけてみましょう。")
     st.caption("※ これはセルフケアのツールで、医療やカウンセリングの代わりではありません。")
-    if PUBLIC_MODE:
-        st.caption(
-            "※ 書いた内容は、返事を作るためにAI（Anthropic社のClaude）に送られます。"
-            "記録はこの端末のブラウザの中だけに保存され、アプリの作者を含め他の人は見られません。"
-            "お名前など、個人が特定できることは書かないでください。"
-        )
 
     if "messages" not in st.session_state:
         st.session_state.messages = []
@@ -497,13 +491,6 @@ def talk_page() -> None:
         st.success(message)
         st.caption("「新しく話す」で次の会話を始められます。これまでの記録は上の「履歴」で見られます。")
 
-    # 相談先は、会話のじゃまにならないよう画面の下に置く
-    with st.expander("つらいときの相談先"):
-        st.markdown(
-            "- 児童相談所 虐待対応ダイヤル **189**（24時間・通話料無料・匿名可）\n"
-            "- よりそいホットライン **0120-279-338**（24時間・通話料無料）"
-        )
-
     # 入力欄
     scene = st.session_state.get("scene") if not messages else st.session_state.scene_value
     if saved:
@@ -515,17 +502,34 @@ def talk_page() -> None:
     else:
         placeholder = "イライラしたできごとを書いてください"
 
-    if prompt := st.chat_input(placeholder, disabled=bool(saved) or not scene):
+    # 送ったあとの吹き出しは、入力欄より上（会話の続き）に出す
+    pending = st.container()
+    # 入力欄を画面下に固定せず会話の流れの中に置き、その下に相談先と注意書きを出す
+    with st.container():
+        prompt = st.chat_input(placeholder, disabled=bool(saved) or not scene)
+    with st.expander("つらいときの相談先"):
+        st.markdown(
+            "- 児童相談所 虐待対応ダイヤル **189**（24時間・通話料無料・匿名可）\n"
+            "- よりそいホットライン **0120-279-338**（24時間・通話料無料）"
+        )
+    if PUBLIC_MODE:
+        st.caption(
+            "※ 書いた内容は、返事を作るためにAI（Anthropic社のClaude）に送られます。"
+            "記録はこの端末のブラウザの中だけに保存され、アプリの作者を含め他の人は見られません。"
+            "お名前など、個人が特定できることは書かないでください。"
+        )
+
+    if prompt:
         if not messages:
             # 入力欄が消えると選んだ値も消えるため、別の場所に写しておく
             st.session_state.scene_value = st.session_state.scene
             st.session_state.before_value = st.session_state.before
             st.session_state.angles = random.sample(QUESTION_ANGLES, 4)
         messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
+        with pending.chat_message("user"):
             st.write(prompt)
 
-        with st.chat_message("assistant"):
+        with pending.chat_message("assistant"):
             try:
                 with st.spinner("考えています…"):
                     reply = ask_claude(messages, st.session_state.scene_value, st.session_state.angles)
